@@ -11,24 +11,68 @@ Filter::Filter(Options* opt){
 Filter::~Filter(){
 }
 
-int Filter::passFilter(Read* r, int lowQualNum, int nBaseNum) {
-    if(r == NULL) {
+int Filter::passFilter(Read* r) {
+    if(r == NULL || r->length()==0) {
         return FAIL_LENGTH;
     }
 
+    int rlen = r->length();
+    int lowQualNum = 0;
+    int nBaseNum = 0;
+
+    // need to recalculate lowQualNum and nBaseNum if the corresponding filters are enabled
+    if(mOptions->qualfilter.enabled || mOptions->lengthFilter.enabled) {
+        const char* seqstr = r->mSeq.mStr.c_str();
+        const char* qualstr = r->mQuality.c_str();
+
+        for(int i=0; i<rlen; i++) {
+            char base = seqstr[i];
+            char qual = qualstr[i];
+
+            if(qual < mOptions->qualfilter.qualifiedQual)
+                lowQualNum ++;
+
+            if(base == 'N')
+                nBaseNum++;
+        }
+    }
+
     if(mOptions->qualfilter.enabled) {
-        if(lowQualNum > (mOptions->qualfilter.unqualifiedPercentLimit * r->length() / 100.0) )
+        if(lowQualNum > (mOptions->qualfilter.unqualifiedPercentLimit * rlen / 100.0) )
             return FAIL_QUALITY;
         else if(nBaseNum > mOptions->qualfilter.nBaseLimit )
             return FAIL_N_BASE;
     }
 
     if(mOptions->lengthFilter.enabled) {
-        if(r->length() < mOptions->lengthFilter.requiredLength)
+        if(rlen < mOptions->lengthFilter.requiredLength)
             return FAIL_LENGTH;
+        if(mOptions->lengthFilter.maxLength > 0 && rlen > mOptions->lengthFilter.maxLength)
+            return FAIL_TOO_LONG;
+    }
+
+    if(mOptions->complexityFilter.enabled) {
+        if(!passLowComplexityFilter(r))
+            return FAIL_COMPLEXITY;
     }
 
     return PASS_FILTER;
+}
+
+bool Filter::passLowComplexityFilter(Read* r) {
+    int diff = 0;
+    int length = r->length();
+    if(length <= 1)
+        return false;
+    const char* data = r->mSeq.mStr.c_str();
+    for(int i=0; i<length-1; i++) {
+        if(data[i] != data[i+1])
+            diff++;
+    }
+    if( (double)diff/(double)(length-1) >= mOptions->complexityFilter.threshold )
+        return true;
+    else
+        return false;
 }
 
 Read* Filter::trimAndCut(Read* r, int front, int tail) {
@@ -55,6 +99,7 @@ Read* Filter::trimAndCut(Read* r, int front, int tail) {
     int w = mOptions->qualityCut.windowSize;
     int l = r->length();
     const char* qualstr = r->mQuality.c_str();
+    const char* seq = r->mSeq.mStr.c_str();
     // quality cutting forward
     if(mOptions->qualityCut.enabled5) {
         int s = front;
@@ -79,6 +124,10 @@ Read* Filter::trimAndCut(Read* r, int front, int tail) {
         }
 
         // the trimming in front is forwarded and rlen is recalculated
+        if(s >0 )
+            s = s+w-1;
+        while(s<l && seq[s] == 'N')
+            s++;
         front = s;
         rlen = l - front - tail;
     }
@@ -106,6 +155,10 @@ Read* Filter::trimAndCut(Read* r, int front, int tail) {
                 break;
         }
 
+        if(t < l-1)
+            t = t-w+1;
+        while(t>=0 && seq[t] == 'N')
+            t--;
         rlen = t - front + 1;
     }
 
@@ -116,6 +169,42 @@ Read* Filter::trimAndCut(Read* r, int front, int tail) {
     r->mQuality = r->mQuality.substr(front, rlen);
 
     return r;
+}
+
+bool Filter::filterByIndex(Read* r) {
+    if(mOptions->indexFilter.enabled) {
+        if( match(mOptions->indexFilter.blacklist1, r->firstIndex(), mOptions->indexFilter.threshold) )
+            return true;
+    }
+    return false;
+}
+
+bool Filter::filterByIndex(Read* r1, Read* r2) {
+    if(mOptions->indexFilter.enabled) {
+        if( match(mOptions->indexFilter.blacklist1, r1->firstIndex(), mOptions->indexFilter.threshold) )
+            return true;
+        if( match(mOptions->indexFilter.blacklist2, r2->lastIndex(), mOptions->indexFilter.threshold) )
+            return true;
+    }
+    return false;
+}
+
+bool Filter::match(vector<string>& list, string target, int threshold) {
+    for(int i=0; i<list.size(); i++) {
+        int diff = 0;
+        int len1 = list[i].length();
+        int len2 = target.length();
+        for(int s=0; s<len1 && s<len2; s++) {
+            if(list[i][s] != target[s]) {
+                diff++;
+                if(diff>threshold)
+                    break;
+            }
+        }
+        if(diff <= threshold)
+            return true;
+    }
+    return false;
 }
 
 bool Filter::test() {
@@ -130,7 +219,8 @@ bool Filter::test() {
     opt.qualityCut.quality = 20;
     Filter filter(&opt);
     Read* ret = filter.trimAndCut(&r, 0, 1);
+    ret->print();
     
-    return ret->mSeq.mStr == "TAACCCCCCCCCCCCCCCCCCCCCCCCCCCCAAT"
-        && ret->mQuality == "//CCCCCCCCCCCC////CCCCCCCCCCCCCC//";
+    return ret->mSeq.mStr == "CCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+        && ret->mQuality == "CCCCCCCCCCC////CCCCCCCCCCCCC";
 }

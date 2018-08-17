@@ -12,6 +12,9 @@
 #include "options.h"
 #include "threadconfig.h"
 #include "filter.h"
+#include "umiprocessor.h"
+#include "writerthread.h"
+#include "duplicate.h"
 
 using namespace std;
 
@@ -24,13 +27,12 @@ typedef struct ReadPack ReadPack;
 
 struct ReadRepository {
     ReadPack** packBuffer;
-    size_t readPos;
-    size_t writePos;
-    size_t readCounter;
-    std::mutex mtx;
-    std::mutex readCounterMtx;
-    std::condition_variable repoNotFull;
-    std::condition_variable repoNotEmpty;
+    atomic_long readPos;
+    atomic_long writePos;
+    //std::mutex mtx;
+    //std::mutex readCounterMtx;
+    //std::condition_variable repoNotFull;
+    //std::condition_variable repoNotEmpty;
 };
 
 typedef struct ReadRepository ReadRepository;
@@ -52,15 +54,21 @@ private:
     void initConfig(ThreadConfig* config);
     void initOutput();
     void closeOutput();
+    void writeTask(WriterThread* config);
 
 private:
     Options* mOptions;
     ReadRepository mRepo;
-    bool mProduceFinished;
+    atomic_bool mProduceFinished;
+    atomic_int mFinishedThreads;
+    std::mutex mInputMtx;
     std::mutex mOutputMtx;
     Filter* mFilter;
     gzFile mZipFile;
     ofstream* mOutStream;
+    UmiProcessor* mUmiProcessor;
+    WriterThread* mLeftWriter;
+    Duplicate* mDuplicate;
 };
 
 

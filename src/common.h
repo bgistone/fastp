@@ -1,7 +1,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 
-#define FASTP_VER "0.4.0"
+#define FASTP_VER "0.19.4"
 
 #define _DEBUG false
 
@@ -24,7 +24,7 @@ typedef unsigned char uint8;
 
 // the limit of the queue to store the packs
 // error may happen if it generates more packs than this number
-static const int PACK_NUM_LIMIT  = 1000000;
+static const int PACK_NUM_LIMIT  = 10000000;
 
 // how many reads one pack has
 static const int PACK_SIZE = 1000;
@@ -45,7 +45,9 @@ static const int FAIL_POLY_X = 4;
 static const int FAIL_OVERLAP = 8;
 static const int FAIL_N_BASE = 12;
 static const int FAIL_LENGTH = 16;
+static const int FAIL_TOO_LONG = 17;
 static const int FAIL_QUALITY = 20;
+static const int FAIL_COMPLEXITY = 24;
 
 // how many types in total we support
 static const int FILTER_RESULT_TYPES = 32;

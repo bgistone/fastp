@@ -9,18 +9,22 @@ AdapterTrimmer::~AdapterTrimmer(){
 
 bool AdapterTrimmer::trimByOverlapAnalysis(Read* r1, Read* r2, FilterResult* fr) {
     OverlapResult ov = OverlapAnalysis::analyze(r1, r2);
+    return trimByOverlapAnalysis(r1, r2, fr, ov);
+}
+
+bool AdapterTrimmer::trimByOverlapAnalysis(Read* r1, Read* r2, FilterResult* fr, OverlapResult ov) {
     int ol = ov.overlap_len;
-    if(ov.diff<=5 && ov.overlapped && ov.offset < 0 && ol > r1->length()/2) {
+    if(ov.diff<=5 && ov.overlapped && ov.offset < 0 && ol > r1->length()/3) {
         string adapter1 = r1->mSeq.mStr.substr(ol, r1->length() - ol);
         string adapter2 = r2->mSeq.mStr.substr(ol, r2->length() - ol);
 
         if(_DEBUG) {
-            cout << adapter1 << endl;
-            cout << adapter2 << endl;
-            cout << "overlap:" << ov.offset << "," << ov.overlap_len << ", " << ov.diff << endl;
+            cerr << adapter1 << endl;
+            cerr << adapter2 << endl;
+            cerr << "overlap:" << ov.offset << "," << ov.overlap_len << ", " << ov.diff << endl;
             r1->print();
             r2->reverseComplement()->print();
-            cout <<endl;
+            cerr <<endl;
         }
 
         r1->mSeq.mStr = r1->mSeq.mStr.substr(0, ol);
@@ -34,27 +38,28 @@ bool AdapterTrimmer::trimByOverlapAnalysis(Read* r1, Read* r2, FilterResult* fr)
     return false;
 }
 
-bool AdapterTrimmer::trimBySequence(Read* r1, FilterResult* fr, string& adapterseq) {
+bool AdapterTrimmer::trimBySequence(Read* r, FilterResult* fr, string& adapterseq, bool isR2) {
     const int matchReq = 4;
     const int allowOneMismatchForEach = 8;
 
-    int rlen = r1->length();
+    int rlen = r->length();
     int alen = adapterseq.length();
 
     const char* adata = adapterseq.c_str();
-    const char* rdata = r1->mSeq.mStr.c_str();
+    const char* rdata = r->mSeq.mStr.c_str();
 
     if(alen < matchReq)
         return false;
 
-    int l=0;
+    int pos=0;
     bool found = false;
-    for(l = matchReq; l<min(rlen, alen); l++) {
-        int allowedMismatch = l/allowOneMismatchForEach;
+    for(pos = 0; pos<rlen-matchReq; pos++) {
+        int cmplen = min(rlen - pos, alen);
+        int allowedMismatch = cmplen/allowOneMismatchForEach;
         int mismatch = 0;
         bool matched = true;
-        for(int i=0; i<l; i++) {
-            if( adata[i] != rdata[rlen - l + i] ){
+        for(int i=0; i<cmplen; i++) {
+            if( adata[i] != rdata[i+pos] ){
                 mismatch++;
                 if(mismatch > allowedMismatch) {
                     matched = false;
@@ -70,11 +75,11 @@ bool AdapterTrimmer::trimBySequence(Read* r1, FilterResult* fr, string& adapters
     }
 
     if(found) {
-        string adapter1 = r1->mSeq.mStr.substr(rlen - l, l);
-        r1->mSeq.mStr = r1->mSeq.mStr.substr(0, rlen - l);
-        r1->mQuality = r1->mQuality.substr(0, rlen - l);
+        string adapter = r->mSeq.mStr.substr(pos, rlen-pos);
+        r->mSeq.mStr = r->mSeq.mStr.substr(0, pos);
+        r->mQuality = r->mQuality.substr(0, pos);
         if(fr) {
-            fr->addAdapterTrimmed(adapter1);
+            fr->addAdapterTrimmed(adapter, isR2);
         }
         return true;
     }

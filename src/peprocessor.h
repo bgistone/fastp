@@ -12,6 +12,10 @@
 #include "options.h"
 #include "threadconfig.h"
 #include "filter.h"
+#include "umiprocessor.h"
+#include "overlapanalysis.h"
+#include "writerthread.h"
+#include "duplicate.h"
 
 
 using namespace std;
@@ -25,13 +29,12 @@ typedef struct ReadPairPack ReadPairPack;
 
 struct ReadPairRepository {
     ReadPairPack** packBuffer;
-    size_t readPos;
-    size_t writePos;
-    size_t readCounter;
-    std::mutex mtx;
-    std::mutex readCounterMtx;
-    std::condition_variable repoNotFull;
-    std::condition_variable repoNotEmpty;
+    atomic_long readPos;
+    atomic_long writePos;
+    //std::mutex mtx;
+    //std::mutex readCounterMtx;
+    //std::condition_variable repoNotFull;
+    //std::condition_variable repoNotEmpty;
 };
 
 typedef struct ReadPairRepository ReadPairRepository;
@@ -54,17 +57,27 @@ private:
     void initConfig(ThreadConfig* config);
     void initOutput();
     void closeOutput();
+    void statInsertSize(Read* r1, Read* r2, OverlapResult& ov);
+    int getPeakInsertSize();
+    void writeTask(WriterThread* config);
 
 private:
     ReadPairRepository mRepo;
-    bool mProduceFinished;
+    atomic_bool mProduceFinished;
+    atomic_int mFinishedThreads;
     std::mutex mOutputMtx;
+    std::mutex mInputMtx;
     Options* mOptions;
     Filter* mFilter;
     gzFile mZipFile1;
     gzFile mZipFile2;
     ofstream* mOutStream1;
     ofstream* mOutStream2;
+    UmiProcessor* mUmiProcessor;
+    long* mInsertSizeHist;
+    WriterThread* mLeftWriter;
+    WriterThread* mRightWriter;
+    Duplicate* mDuplicate;
 };
 
 

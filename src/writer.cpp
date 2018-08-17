@@ -40,6 +40,7 @@ void Writer::init(){
 	if (ends_with(mFilename, ".gz")){
 		mZipFile = gzopen(mFilename.c_str(), "w");
         gzsetparams(mZipFile, mCompression, Z_DEFAULT_STRATEGY);
+        gzbuffer(mZipFile, 1024*1024);
 		mZipped = true;
 	}
 	else {
@@ -51,8 +52,8 @@ void Writer::init(){
 
 bool Writer::writeLine(string& linestr){
 	const char* line = linestr.c_str();
-	int size = linestr.length();
-	int written;
+	size_t size = linestr.length();
+	size_t written;
 	bool status;
 	if(mZipped){
 		written = gzwrite(mZipFile, line, size);
@@ -70,8 +71,8 @@ bool Writer::writeLine(string& linestr){
 
 bool Writer::writeString(string& str){
 	const char* strdata = str.c_str();
-	int size = str.length();
-	int written;
+	size_t size = str.length();
+	size_t written;
 	bool status;
 	if(mZipped){
 		written = gzwrite(mZipFile, strdata, size);
@@ -82,6 +83,21 @@ bool Writer::writeString(string& str){
 		status = !mOutStream->fail();
 	}
 
+	return status;
+}
+
+bool Writer::write(char* strdata, size_t size) {
+	size_t written;
+	bool status;
+	
+	if(mZipped){
+		written = gzwrite(mZipFile, strdata, size);
+		status = size == written;
+	}
+	else{
+		mOutStream->write(strdata, size);
+		status = !mOutStream->fail();
+	}
 	return status;
 }
 

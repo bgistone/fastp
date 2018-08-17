@@ -9,44 +9,42 @@
 #include "jsonreporter.h"
 #include "htmlreporter.h"
 #include "adaptertrimmer.h"
+#include "polyx.h"
 
 SingleEndProcessor::SingleEndProcessor(Options* opt){
     mOptions = opt;
     mProduceFinished = false;
+    mFinishedThreads = 0;
     mFilter = new Filter(opt);
     mOutStream = NULL;
     mZipFile = NULL;
+    mUmiProcessor = new UmiProcessor(opt);
+    mLeftWriter =  NULL;
+
+    mDuplicate = NULL;
+    if(mOptions->duplicate.enabled) {
+        mDuplicate = new Duplicate(mOptions);
+    }
 }
 
 SingleEndProcessor::~SingleEndProcessor() {
     delete mFilter;
+    if(mDuplicate) {
+        delete mDuplicate;
+        mDuplicate = NULL;
+    }
 }
 
 void SingleEndProcessor::initOutput() {
     if(mOptions->out1.empty())
         return;
-    if (ends_with(mOptions->out1, ".gz")){
-        mZipFile = gzopen(mOptions->out1.c_str(), "w");
-        gzsetparams(mZipFile, mOptions->compression, Z_DEFAULT_STRATEGY);
-    }
-    else {
-        mOutStream = new ofstream();
-        mOutStream->open(mOptions->out1.c_str(), ifstream::out);
-    }
+    mLeftWriter = new WriterThread(mOptions, mOptions->out1);
 }
 
 void SingleEndProcessor::closeOutput() {
-    if (mZipFile){
-        gzflush(mZipFile, Z_FINISH);
-        gzclose(mZipFile);
-        mZipFile = NULL;
-    }
-    if (mOutStream) {
-        if (mOutStream->is_open()){
-            mOutStream->flush();
-            mOutStream->close();
-        }
-        delete mOutStream;
+    if(mLeftWriter) {
+        delete mLeftWriter;
+        mLeftWriter = NULL;
     }
 }
 
@@ -54,13 +52,7 @@ void SingleEndProcessor::initConfig(ThreadConfig* config) {
     if(mOptions->out1.empty())
         return;
 
-    if(!mOptions->split.enabled) {
-        if(mOutStream != NULL) {
-            config->initWriter(mOutStream);
-        } else if(mZipFile != NULL) {
-            config->initWriter(mZipFile);
-        }
-    } else {
+    if(mOptions->split.enabled) {
         config->initWriterForSplit();
     }
 }
@@ -76,7 +68,7 @@ bool SingleEndProcessor::process(){
     int cycle = 151;
     ThreadConfig** configs = new ThreadConfig*[mOptions->thread];
     for(int t=0; t<mOptions->thread; t++){
-        configs[t] = new ThreadConfig(mOptions, cycle, t, false);
+        configs[t] = new ThreadConfig(mOptions, t, false);
         initConfig(configs[t]);
     }
 
@@ -85,10 +77,22 @@ bool SingleEndProcessor::process(){
         threads[t] = new std::thread(std::bind(&SingleEndProcessor::consumerTask, this, configs[t]));
     }
 
+    std::thread* leftWriterThread = NULL;
+    if(mLeftWriter)
+        leftWriterThread = new std::thread(std::bind(&SingleEndProcessor::writeTask, this, mLeftWriter));
+
     producer.join();
     for(int t=0; t<mOptions->thread; t++){
         threads[t]->join();
     }
+
+    if(!mOptions->split.enabled) {
+        if(leftWriterThread)
+            leftWriterThread->join();
+    }
+
+    if(mOptions->verbose)
+        loginfo("start to generate reports\n");
 
     // merge stats and read filter results
     vector<Stats*> preStats;
@@ -109,22 +113,38 @@ bool SingleEndProcessor::process(){
         postStats.push_back(configs[t]->getPostStats1());
     }
 
-    cout << "Read1 before filtering:"<<endl;
+    cerr << "Read1 before filtering:"<<endl;
     finalPreStats->print();
-    cout << endl;
-    cout << "Read1 after filtering:"<<endl;
+    cerr << endl;
+    cerr << "Read1 after filtering:"<<endl;
     finalPostStats->print();
 
-    cout << endl;
-    cout << "Filtering result:"<<endl;
+    cerr << endl;
+    cerr << "Filtering result:"<<endl;
     finalFilterResult->print();
+
+    int* dupHist = NULL;
+    double* dupMeanTlen = NULL;
+    double* dupMeanGC = NULL;
+    double dupRate = 0.0;
+    if(mOptions->duplicate.enabled) {
+        dupHist = new int[mOptions->duplicate.histSize];
+        memset(dupHist, 0, sizeof(int) * mOptions->duplicate.histSize);
+        dupMeanGC = new double[mOptions->duplicate.histSize];
+        memset(dupMeanGC, 0, sizeof(double) * mOptions->duplicate.histSize);
+        dupRate = mDuplicate->statAll(dupHist, dupMeanGC, mOptions->duplicate.histSize);
+        cerr << endl;
+        cerr << "Duplication rate (may be overestimated since this is SE data): " << dupRate * 100.0 << "%" << endl;
+    }
 
     // make JSON report
     JsonReporter jr(mOptions);
+    jr.setDupHist(dupHist, dupMeanGC, dupRate);
     jr.report(finalFilterResult, finalPreStats, finalPostStats);
 
     // make HTML report
     HtmlReporter hr(mOptions);
+    hr.setDupHist(dupHist, dupMeanGC, dupRate);
     hr.report(finalFilterResult, finalPreStats, finalPostStats);
 
     // clean up
@@ -139,8 +159,16 @@ bool SingleEndProcessor::process(){
     delete finalPostStats;
     delete finalFilterResult;
 
-    delete threads;
-    delete configs;
+    if(mOptions->duplicate.enabled) {
+        delete[] dupHist;
+        delete[] dupMeanGC;
+    }
+
+    delete[] threads;
+    delete[] configs;
+
+    if(leftWriterThread)
+        delete leftWriterThread;
 
     if(!mOptions->split.enabled)
         closeOutput();
@@ -150,26 +178,44 @@ bool SingleEndProcessor::process(){
 
 bool SingleEndProcessor::processSingleEnd(ReadPack* pack, ThreadConfig* config){
     string outstr;
+    int readPassed = 0;
     for(int p=0;p<pack->count;p++){
 
         // original read1
         Read* or1 = pack->data[p];
 
-        int lowQualNum = 0;
-        int nBaseNum = 0;
-
         // stats the original read before trimming
-        config->getPreStats1()->statRead(or1, lowQualNum, nBaseNum, mOptions->qualfilter.qualifiedQual);
+        config->getPreStats1()->statRead(or1);
 
+        // handling the duplication profiling
+        if(mDuplicate)
+            mDuplicate->statRead(or1);
+
+        // filter by index
+        if(mOptions->indexFilter.enabled && mFilter->filterByIndex(or1)) {
+            delete or1;
+            continue;
+        }
+        
+        // umi processing
+        if(mOptions->umi.enabled)
+            mUmiProcessor->process(or1);
 
         // trim in head and tail, and apply quality cut in sliding window
         Read* r1 = mFilter->trimAndCut(or1, mOptions->trim.front1, mOptions->trim.tail1);
 
-        if(r1 != NULL && mOptions->adapter.enabled && !mOptions->adapter.sequence.empty()){
+        if(r1 != NULL) {
+            if(mOptions->polyGTrim.enabled)
+                PolyX::trimPolyG(r1, config->getFilterResult(), mOptions->polyGTrim.minLen);
+            if(mOptions->polyXTrim.enabled)
+                PolyX::trimPolyX(r1, config->getFilterResult(), mOptions->polyXTrim.minLen);
+        }
+
+        if(r1 != NULL && mOptions->adapter.enabled && mOptions->adapter.hasSeqR1){
             AdapterTrimmer::trimBySequence(r1, config->getFilterResult(), mOptions->adapter.sequence);
         }
 
-        int result = mFilter->passFilter(r1, lowQualNum, nBaseNum);
+        int result = mFilter->passFilter(r1);
 
         config->addFilterResult(result);
 
@@ -177,7 +223,8 @@ bool SingleEndProcessor::processSingleEnd(ReadPack* pack, ThreadConfig* config){
             outstr += r1->toString();
 
             // stats the read after filtering
-            config->getPostStats1()->statRead(r1, lowQualNum, nBaseNum, mOptions->qualfilter.qualifiedQual);
+            config->getPostStats1()->statRead(r1);
+            readPassed++;
         }
 
         delete or1;
@@ -188,15 +235,30 @@ bool SingleEndProcessor::processSingleEnd(ReadPack* pack, ThreadConfig* config){
     // if splitting output, then no lock is need since different threads write different files
     if(!mOptions->split.enabled)
         mOutputMtx.lock();
-    if(!mOptions->out1.empty())
-        config->getWriter1()->writeString(outstr);
+    if(mOptions->outputToSTDOUT) {
+        fwrite(outstr.c_str(), 1, outstr.length(), stdout);
+    } else if(mOptions->split.enabled) {
+        // split output by each worker thread
+        if(!mOptions->out1.empty())
+            config->getWriter1()->writeString(outstr);
+    } 
+    else {
+        if(mLeftWriter) {
+            char* ldata = new char[outstr.size()];
+            memcpy(ldata, outstr.c_str(), outstr.size());
+            mLeftWriter->input(ldata, outstr.size());
+        }
+    }
     if(!mOptions->split.enabled)
         mOutputMtx.unlock();
 
+    if(mOptions->split.byFileLines)
+        config->markProcessed(readPassed);
+    else
+        config->markProcessed(pack->count);
+
     delete pack->data;
     delete pack;
-
-    config->markProcessed(pack->count);
 
     return true;
 }
@@ -206,7 +268,7 @@ void SingleEndProcessor::initPackRepository() {
     memset(mRepo.packBuffer, 0, sizeof(ReadPack*)*PACK_NUM_LIMIT);
     mRepo.writePos = 0;
     mRepo.readPos = 0;
-    mRepo.readCounter = 0;
+    //mRepo.readCounter = 0;
     
 }
 
@@ -216,49 +278,61 @@ void SingleEndProcessor::destroyPackRepository() {
 }
 
 void SingleEndProcessor::producePack(ReadPack* pack){
-    std::unique_lock<std::mutex> lock(mRepo.mtx);
-    while(((mRepo.writePos + 1) % PACK_NUM_LIMIT)
+    //std::unique_lock<std::mutex> lock(mRepo.mtx);
+    /*while(((mRepo.writePos + 1) % PACK_NUM_LIMIT)
         == mRepo.readPos) {
-        mRepo.repoNotFull.wait(lock);
-    }
+        //mRepo.repoNotFull.wait(lock);
+    }*/
 
     mRepo.packBuffer[mRepo.writePos] = pack;
     mRepo.writePos++;
 
-    if (mRepo.writePos == PACK_NUM_LIMIT)
-        mRepo.writePos = 0;
+    /*if (mRepo.writePos == PACK_NUM_LIMIT)
+        mRepo.writePos = 0;*/
 
-    mRepo.repoNotEmpty.notify_all();
-    lock.unlock();
+    //mRepo.repoNotEmpty.notify_all();
+    //lock.unlock();
 }
 
 void SingleEndProcessor::consumePack(ThreadConfig* config){
     ReadPack* data;
-    std::unique_lock<std::mutex> lock(mRepo.mtx);
-    // read buffer is empty, just wait here.
-    while(mRepo.writePos == mRepo.readPos) {
+    //std::unique_lock<std::mutex> lock(mRepo.mtx);
+    // buffer is empty, just wait here.
+    /*while(mRepo.writePos % PACK_NUM_LIMIT == mRepo.readPos % PACK_NUM_LIMIT) {
         if(mProduceFinished){
-            lock.unlock();
+            //lock.unlock();
             return;
         }
-        mRepo.repoNotEmpty.wait(lock);
-    }
+        //mRepo.repoNotEmpty.wait(lock);
+    }*/
 
+    mInputMtx.lock();
+    while(mRepo.writePos <= mRepo.readPos) {
+        usleep(1000);
+        if(mProduceFinished) {
+            mInputMtx.unlock();
+            return;
+        }
+    }
     data = mRepo.packBuffer[mRepo.readPos];
-    (mRepo.readPos)++;
-    lock.unlock();
+    mRepo.readPos++;
+
+    /*if (mRepo.readPos >= PACK_NUM_LIMIT)
+        mRepo.readPos = 0;*/
+    mInputMtx.unlock();
+
+    //lock.unlock();
+    //mRepo.repoNotFull.notify_all();
 
     processSingleEnd(data, config);
 
-
-    if (mRepo.readPos >= PACK_NUM_LIMIT)
-        mRepo.readPos = 0;
-
-    mRepo.repoNotFull.notify_all();
 }
 
 void SingleEndProcessor::producerTask()
 {
+    if(mOptions->verbose)
+        loginfo("start to load data");
+    long lastReported = 0;
     int slept = 0;
     long readNum = 0;
     bool splitSizeReEvaluated = false;
@@ -266,21 +340,36 @@ void SingleEndProcessor::producerTask()
     memset(data, 0, sizeof(Read*)*PACK_SIZE);
     FastqReader reader(mOptions->in1, true, mOptions->phred64);
     int count=0;
+    bool needToBreak = false;
     while(true){
         Read* read = reader.read();
-        if(!read){
+        // TODO: put needToBreak here is just a WAR for resolve some unidentified dead lock issue 
+        if(!read || needToBreak){
             // the last pack
             ReadPack* pack = new ReadPack;
             pack->data = data;
             pack->count = count;
             producePack(pack);
             data = NULL;
+            if(read) {
+                delete read;
+                read = NULL;
+            }
             break;
         }
         data[count] = read;
         count++;
+        // configured to process only first N reads
+        if(mOptions->readsToProcess >0 && count + readNum >= mOptions->readsToProcess) {
+            needToBreak = true;
+        }
+        if(mOptions->verbose && count + readNum >= lastReported + 1000000) {
+            lastReported = count + readNum;
+            string msg = "loaded " + to_string((lastReported/1000000)) + "M reads";
+            loginfo(msg);
+        }
         // a full pack
-        if(count == PACK_SIZE){
+        if(count == PACK_SIZE || needToBreak){
             ReadPack* pack = new ReadPack;
             pack->data = data;
             pack->count = count;
@@ -288,54 +377,110 @@ void SingleEndProcessor::producerTask()
             //re-initialize data for next pack
             data = new Read*[PACK_SIZE];
             memset(data, 0, sizeof(Read*)*PACK_SIZE);
-            // reset count to 0
-            count = 0;
             // if the consumer is far behind this producer, sleep and wait to limit memory usage
             while(mRepo.writePos - mRepo.readPos > PACK_IN_MEM_LIMIT){
-                //cout<<"sleep"<<endl;
+                //cerr<<"sleep"<<endl;
                 slept++;
                 usleep(100);
             }
-            readNum += PACK_SIZE;
-            // re-evaluate split size
-            if(mOptions->split.enabled && !splitSizeReEvaluated && readNum >= mOptions->split.size) {
-                size_t bytesRead;
-                size_t bytesTotal;
-                reader.getBytes(bytesRead, bytesTotal);
-                mOptions->split.size *=  (double)bytesTotal / ((double)bytesRead * (double) mOptions->split.number);
-                if(mOptions->split.size <= 0)
-                    mOptions->split.size = 1;
-                splitSizeReEvaluated = true;
+            readNum += count;
+            // if the writer threads are far behind this producer, sleep and wait
+            // check this only when necessary
+            if(readNum % (PACK_SIZE * PACK_IN_MEM_LIMIT) == 0 && mLeftWriter) {
+                while(mLeftWriter->bufferLength() > PACK_IN_MEM_LIMIT) {
+                    slept++;
+                    usleep(1000);
+                }
             }
+            // reset count to 0
+            count = 0;
+            // re-evaluate split size
+            // TODO: following codes are commented since it may cause threading related conflicts in some systems
+            /*if(mOptions->split.needEvaluation && !splitSizeReEvaluated && readNum >= mOptions->split.size) {
+                splitSizeReEvaluated = true;
+                // greater than the initial evaluation
+                if(readNum >= 1024*1024) {
+                    size_t bytesRead;
+                    size_t bytesTotal;
+                    reader.getBytes(bytesRead, bytesTotal);
+                    mOptions->split.size *=  (double)bytesTotal / ((double)bytesRead * (double) mOptions->split.number);
+                    if(mOptions->split.size <= 0)
+                        mOptions->split.size = 1;
+                }
+            }*/
         }
     }
 
-    std::unique_lock<std::mutex> lock(mRepo.readCounterMtx);
+    //std::unique_lock<std::mutex> lock(mRepo.readCounterMtx);
     mProduceFinished = true;
-    lock.unlock();
+    if(mOptions->verbose)
+        loginfo("all reads loaded, start to monitor thread status");
+    //lock.unlock();
 
     // if the last data initialized is not used, free it
     if(data != NULL)
-        delete data;
+        delete[] data;
 }
 
 void SingleEndProcessor::consumerTask(ThreadConfig* config)
 {
     while(true) {
         if(config->canBeStopped()){
+            mFinishedThreads++;
             break;
         }
-        std::unique_lock<std::mutex> lock(mRepo.readCounterMtx);
+        while(mRepo.writePos <= mRepo.readPos) {
+            if(mProduceFinished)
+                break;
+            usleep(1000);
+        }
+        //std::unique_lock<std::mutex> lock(mRepo.readCounterMtx);
         if(mProduceFinished && mRepo.writePos == mRepo.readPos){
-            lock.unlock();
+            mFinishedThreads++;
+            if(mOptions->verbose) {
+                string msg = "thread " + to_string(config->getThreadId() + 1) + " data processing completed";
+                loginfo(msg);
+            }
+            //lock.unlock();
             break;
         }
         if(mProduceFinished){
+            if(mOptions->verbose) {
+                string msg = "thread " + to_string(config->getThreadId() + 1) + " is processing the " + to_string(mRepo.readPos) + " / " + to_string(mRepo.writePos) + " pack";
+                loginfo(msg);
+            }
             consumePack(config);
-            lock.unlock();
+            //lock.unlock();
         } else {
-            lock.unlock();
+            //lock.unlock();
             consumePack(config);
         }
+    }
+
+    if(mFinishedThreads == mOptions->thread) {
+        if(mLeftWriter)
+            mLeftWriter->setInputCompleted();
+    }
+
+    if(mOptions->verbose) {
+        string msg = "thread " + to_string(config->getThreadId() + 1) + " finished";
+        loginfo(msg);
+    }
+}
+
+void SingleEndProcessor::writeTask(WriterThread* config)
+{
+    while(true) {
+        if(config->isCompleted()){
+            // last check for possible threading related issue
+            config->output();
+            break;
+        }
+        config->output();
+    }
+
+    if(mOptions->verbose) {
+        string msg = config->getFilename() + " writer finished";
+        loginfo(msg);
     }
 }

@@ -7,8 +7,29 @@
 #include <vector>
 #include <sys/stat.h>
 #include <algorithm>
+#include <time.h>
+#include <mutex>
 
 using namespace std;
+
+inline char complement(char base) {
+    switch(base){
+        case 'A':
+        case 'a':
+            return 'T';
+        case 'T':
+        case 't':
+            return 'A';
+        case 'C':
+        case 'c':
+            return 'G';
+        case 'G':
+        case 'g':
+            return 'C';
+        default:
+            return 'N';
+    }
+}
 
 inline bool starts_with( string const & value,  string const & starting)
 {
@@ -88,6 +109,14 @@ inline string replace(const string& str, const string& src, const string& dest)
     return ret;
 }
 
+inline string reverse(const string& str) {
+    string ret(str.length(), 0);
+    for(int pos=0; pos<str.length(); pos++) {
+        ret[pos] = str[str.length() - pos - 1];
+    }
+    return ret;
+}
+
 inline string basename(const string& filename){
     string::size_type pos = filename.find_last_of('/');
     if (pos == string::npos)
@@ -158,6 +187,18 @@ inline void check_file_valid(const  string& s) {
     }
 }
 
+inline void check_file_writable(const  string& s) {
+    string dir = dirname(s);
+    if(!file_exists(dir)) {
+        cerr << "ERROR: '" << dir << " doesn't exist. Create this folder and run this command again." << endl;
+        exit(-1);
+    }
+    if(is_directory(s)){
+        cerr << "ERROR: '" << s << "' is not a writable file, quit now" << endl;
+        exit(-1);
+    }
+}
+
 // Remove non alphabetic characters from a string
 inline  string str_keep_alpha(const  string& s)
 {
@@ -212,6 +253,15 @@ inline char num2qual(int num) {
 inline void error_exit(const string& msg) {
     cerr << "ERROR: " << msg << endl;
     exit(-1);
+}
+
+extern mutex logmtx;
+inline void loginfo(const string s){
+    logmtx.lock();
+    time_t tt = time(NULL);
+    tm* t= localtime(&tt);
+    cerr<<"["<<t->tm_hour<<":"<<t->tm_min<<":"<<t->tm_sec<<"] "<<s<<endl;
+    logmtx.unlock();
 }
 
 #endif /* UTIL_H */
